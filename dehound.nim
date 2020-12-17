@@ -1,65 +1,91 @@
-import httpclient, json, nre, os, osproc, strformat, strutils, sugar, terminal, uri
+import httpclient, json, os, strutils, strformat, sugar
 
-type
-  Password = string
-  TokenError* = object of Exception
-  Repository = tuple[owner: string, repo: string, id: string]
+import auth, utils
 
-proc get_token(): Password =
-  let (password, errorC) = execCmdex("security find-generic-password -a 'dehound' -s github.com -w")
-  if errorC == 0:
-    result = password.strip
-  else:
-    raise newException(TokenError, "Couldn't get token")
+const graphQLUrl = "https://api.github.com/graphql"
+const graphQLRequest = """
+query($url: URI!) {
+  resource(url: $url) {
+    ... on PullRequest {
+      reviews(last: 100, author: "houndci-bot") {
+        edges {
+          node {
+            author {
+              login
+            }
+            id
+            comments(first: 100) {
+              edges {
+                node {
+                  author {
+                    login
+                  }
+                  id
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
 
-proc save_token(token: string): void =
-  let errorC = execCmd("security add-generic-password -a 'dehound' -s github.com -w '" & token & "'")
-  if errorC > 0:
-    raise newException(TokenError, "Couldn't save token")
-
-proc get_or_save_token(): Password =
-  try:
-    result = get_token()
-  except TokenError:
-    echo "Go to https://github.com/settings/tokens/new?scopes=repo&name=Dehound and generate a new token. Paste it here"
-    result = readPasswordFromStdin(prompt = "github.com token:")
-    save_token(result)
-  finally:
-    return result
-
-proc extract_pr_info(base_url: string): Repository =
-  let
-    uri = parseUri(base_url)
-    matchdata = uri.path.match(re"(?i)/(?<owner>.*?)/(?<repo>.*?)/pull/(?<id>\d+)").get.captures
-
-  result = (matchdata[0], matchdata[1], matchdata[2])
-
-proc init_http_client(): HttpClient =
+proc initHttpClient(): HttpClient =
   let token = get_or_save_token()
   result = newHttpClient()
-  result.headers["Authorization"] = "token " & token
+  result.headers = newHttpHeaders({
+    "Authorization": fmt"Bearer {token}",
+    "Content-type": "application/json"
+  })
   return
 
-let client = init_http_client()
+let client = initHttpClient()
 
-proc get_comments(repository: Repository): JsonNode =
-  let url = "https://api.github.com/repos/$1/$2/pulls/$3/comments" % [repository.owner, repository.repo, repository.id]
+proc getComments(url: string): seq[string] =
+  var body = %* {
+    "query": graphQLRequest,
+    "variables": {
+      "url": url
+    }
+  }
 
-  return client.get(url).body.parseJson
+  var response = client.post(url = graphQLUrl, body = $body)
 
-proc delete_hound_comments(comments: JsonNode) =
-  for comment in lc[c | (c <- comments, c["user"]["login"].getStr() == "houndci-bot"), JsonNode]:
-    discard client.request(comment["url"].getStr(), "DELETE")
+  if response.code != Http200:
+    raise newException(HttpRequestError, fmt"Github fetch returned code {response.code}")
 
-# var
-#   repository = extract_pr_info("https://github.com/TheRealReal/therealreal-website/pull/1861")
-#   comments = get_comments(repository)
+  var responseResource = response.body.parseJson{"data", "resource"}
 
-# delete_hound_comments(comments)
+  return collect(newSeq):
+    for edge in responseResource{"reviews", "edges"}.items:
+      for commentEdge in edge{"node", "comments", "edges"}.items:
+        if commentEdge{"node", "author", "login"}.getStr == "houndci-bot": commentEdge{"node", "id"}.getStr
+
+
+proc deleteComments(comments: seq[string]): void=
+  var mutations = collect(newSeq):
+    for idx, id in comments.pairs:
+      fmt"""
+        {letterize(idx)}: deletePullRequestReviewComment(input: {{id: "{id}"}}) {{
+          clientMutationId
+        }}
+      """
+
+  let query = %* {
+    "query": fmt"""
+      mutation {{
+        {mutations.join("\n")}
+      }}
+    """
+    }
+
+  var response = client.post(url = graphQLUrl, body = $query)
+
+  if response.code != Http200:
+    raise newException(HttpRequestError, fmt"Github delete returned code {response.code}: {response.body}")
 
 for url in commandLineParams():
-  echo "Deleting comments on '$1'" % [url]
-  extract_pr_info(url).get_comments().delete_hound_comments()
-
-echo "Done!"
+  getComments(url).deletecomments()
 quit()
